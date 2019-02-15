@@ -1,17 +1,17 @@
 # MIT License
-# 
+#
 # Copyright (c) 2019 Keisuke Sehara
-# 
+#
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
 # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
-# 
+#
 # The above copyright notice and this permission notice shall be included in all
 # copies or substantial portions of the Software.
-# 
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -22,29 +22,103 @@
 
 import pathlib as _pathlib
 import json as _json
+import zlib as _zlib
 from collections import OrderedDict as _OrderedDict
 from functools import wraps
 
 import numpy as _np
 
-VERSION_STR = "0.0.1"
+"""stappy -- a storage-access protocol in python.
 
-SEP = '/'
-DEBUG = True
+TODO: deal with endian-ness...
+"""
+
+VERSION_STR = "0.0.1"
+DEBUG       = False
+
+SEP         = '/'
+INFO_TYPES  = (int, float, str)
 
 def debug(msg):
     if DEBUG == True:
         print(f"[DEBUG] {msg}")
-
-class DELETE_KEY:
-    """used to delete a key in the `info` dictionary."""
-    pass
 
 def abstractmethod(meth):
     @wraps(meth)
     def __invalid_call__(self, *args, **kwargs):
         raise NotImplementedError(meth.__name__)
     return __invalid_call__
+
+def is_namedtuple_struct(obj):
+    return isinstance(obj, tuple) and hasattr(obj, '_fields') \
+            and all(isinstance(item,  INFO_TYPES + (_np.ndarray,)) for item in obj)
+
+class AttributeManager:
+    def __init__(self, interface):
+        self._interface = interface
+        self._updating  = False
+        self._dirtyflag = False
+
+    def lock(self):
+        if self._updating == True:
+            return False
+        self._updating  = True
+
+    def flag(self):
+        if self._updating  == True:
+            self._dirtyflag = True
+        else:
+            self._interface._store_info()
+
+    def commit(self):
+        self._updating  = False
+        if self._dirtyflag == True:
+            self._interface._store_info()
+            self._dirtyflag = False
+
+    def rollback(self):
+        self._updating   = False
+        if self._dirtyflag == True:
+            self._interface._load_info()
+            self._dirtyflag = False
+
+    def keys(self):
+        return self._interface._info.keys()
+
+    def values(self):
+        return self._interface._info.values()
+
+    def items(self):
+        return self._interface._info.items()
+
+    def __getitem__(self, keypath):
+        entry, key = self.__resolve_keypath(keypath, create=False)
+        return entry[key]
+
+    def __setitem__(self, keypath, value):
+        entry, key = self.__resolve_keypath(keypath, create=True)
+        entry[keypath[-1]] = value
+        debug(f"AttributeManager: {repr(keypath)} <- {repr(value)}")
+        self.flag()
+
+    def __delitem__(self, keypath):
+        entry, key = self.__resolve_keypath(keypath, create=False)
+        del entry[key]
+        debug(f"AttributeManager: `rm` {repr(keypath)}")
+        self.flag()
+
+    def __resolve_keypath(self, keypath, create=True):
+        entry   = self._interface._info
+        keypath = keypath.split(SEP)
+        # traverse to the deepest entry
+        for key in keypath[:-1]:
+            if key not in entry.keys():
+                if create == True:
+                    entry[key] = _OrderedDict()
+                else:
+                    raise KeyError(key)
+            entry = entry[key]
+        return entry, key[-1]
 
 class AbstractInterface:
     """base class that provides common functionality.
@@ -64,8 +138,9 @@ class AbstractInterface:
     If the subclasses intend to use the structure other than the file system,
     they must implement the other methods:
 
-    - `_root_repr`
-    - `_get_repr`
+    - `_open_root_repr`
+    - `_free_root_repr`
+    - `_get_volatile_repr`
     - `_list_contents`
     - `_load_info`
     - `_store_info`
@@ -76,8 +151,19 @@ class AbstractInterface:
     _info_suffix = ".json"
     _data_suffix = None
 
+    @classmethod
+    def _open_root_repr(cls, rootpath):
+        """initializes the physical representation of the root at `rootpath`.
+        returns (new, obj) tuple, where `new` indicates whether the root `obj`
+        is newly created."""
+        raise NotImplementedError("_root_repr")
+
+    @classmethod
+    def _free_root_repr(cls, rootrepr):
+        raise NotImplementedError("_free_root_repr")
+
     @abstractmethod
-    def _get_repr(self, parent, name):
+    def _get_volatile_repr(self, parent, name):
         """creates `self`'s physical representation based on
         `parent` and `name` information.
 
@@ -136,21 +222,41 @@ class AbstractInterface:
         pass
 
     @classmethod
-    def open(cls, rootpath):
+    def open(cls, rootpath, **kwargs):
         """returns the 'root' entry (that has different terminology)."""
         root                = cls("", parent=None)
-        created, root._repr = cls._root_repr(rootpath)
+        created, root._repr = cls._open_root_repr(rootpath)
         root._root          = root._repr
+        root._path          = ''
         if not created:
-            root.load_info()
+            root._load_info()
+
+        def _update(src):
+            return root.__class__._copy_from_another_root(src=src, dest=root)
+        def _close():
+            return root.__class__.close(root)
+        root.update = _update
+        root.close  = _close
+        if len(kwargs) > 0:
+            for key, value in kwargs:
+                setattr(root, key, value)
         return root
 
     @classmethod
-    def _root_repr(cls, rootpath):
-        """initializes the physical representation of the root at `rootpath`.
-        returns (new, obj) tuple, where `new` indicates whether the root `obj`
-        is newly created."""
-        raise NotImplementedError("_root_repr")
+    def close(cls, rootobj=None):
+        """free the physical representation of this root object."""
+        if not rootobj.is_root():
+            raise ValueError("close() not applied to the root object")
+        else:
+            cls._free_root_repr(rootobj._repr)
+            rootobj.invalidate()
+
+    @classmethod
+    def _copy_from_another_root(cls, src=None, dest=None):
+        if (not src.is_root()) or (not dest.is_root()):
+            raise ValueError("invalid call to copy()")
+        for name, value in src.items():
+            dest[name] = value
 
     def __init__(self, name, parent=None):
         """creates (ensures) the directory with the matched name.
@@ -172,28 +278,57 @@ class AbstractInterface:
         self._parent= parent
         if parent is not None:
             self._root  = parent._root
-            self._repr  = self._get_repr(parent, name)
-            self.load_info()
+            self._repr  = self._get_volatile_repr(parent, name)
+            self._path  = f"{parent._path}{SEP}{name}"
+            self._load_info()
+        self.attrs  = AttributeManager(self)
         self._valid = True
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({str(self._repr)})@<{str(self._root)}>"
+        if self._valid == True:
+            return f"{self.__class__.__name__}({repr(str(self._root))})[{repr(str(self._path))}]"
+        else:
+            return f"{self.__class__.__name__}(#invalid)"
 
     def __getitem__(self, keypath):
-        keys = keypath.split(SEP)
-        entry = self
-        for key in keys[:-1]:
-            if key in entry.children():
-                entry = entry.get_entry(key, create=False)
-            else:
-                raise KeyError(key)
-        key = keys[-1]
-        if key in entry.children():
+        entry, key = self.resolve_path(keypath, create=False)
+        if key in entry.child_names():
             return entry.get_entry(key, create=False)
-        elif key in entry.datasets():
+        elif key in entry.dataset_names():
             return entry.get_dataset(key)
         else:
             raise KeyError(key)
+
+    def __setitem__(self, keypath, value):
+        if not isinstance(value, (AbstractInterface, _np.ndarray)):
+            raise ValueError("stappy interface only accepts entry-types or numpy arrays")
+        entry, key = self.resolve_path(keypath, create=True)
+        if isinstance(value, AbstractInterface):
+            entry.put_entry(key, value)
+        elif isinstance(value, _np.ndarray):
+            entry.put_dataset(key, value)
+        else:
+            raise RuntimeError("fatal error: class assertion failed")
+
+    def __delitem__(self, keypath):
+        entry, key = self.resolve_path(keypath, create=False)
+        if key in entry.child_names():
+            # entry
+            entry.delete_entry(key)
+        elif key in entry.dataset_names():
+            # dataset
+            entry.delete_dataset(key)
+        else:
+            raise KeyError(key)
+
+    def resolve_path(self, keypath, create=True):
+        """returns (dparent, key), where `dparent` indicates the
+        direct parent of the value specified by `keypath`."""
+        keys = keypath.split(SEP)
+        entry = self
+        for key in keys[:-1]:
+            entry = entry.get_entry(key, create=create)
+        return entry, keys[-1]
 
     def invalidate(self):
         """makes this object invalid as a reference."""
@@ -204,45 +339,43 @@ class AbstractInterface:
         self._repr   = None
         self._valid  = False
 
-    def children(self):
+    def is_root(self):
+        return (self._parent is None)
+
+    def keys(self):
+        """returns a sequence of names of children (child entries and datasets irrelevant)."""
+        return self._list_contents(children=True, datasets=True)
+
+    def child_names(self):
         """returns a sequence of its child entries."""
         return self._list_contents(children=True, datasets=False)
 
-    def datasets(self):
+    def dataset_names(self):
         """returns a sequence of datasets that this entry contains."""
         return self._list_contents(children=False, datasets=True)
 
-    def update_info(self, keypath, value, write=True):
-        """updates the `info` attribute and overwrite the stored data.
-        `keypath` may be split by '/' for describing its hierarchy.
+    def values(self):
+        """returns a generator of children (entries and datasets)."""
+        for name in self.keys():
+            yield self.__getitem__(name)
 
-        use `astore.DELETE_KEY` in place of `value` when you want to delete
-        value(s) at `keypath`.
+    def children(self):
+        for name in self.child_names():
+            yield self.get_entry(name, create=False)
 
-        if write is True (default), the updated `info` may be immediately
-        written to its storage."""
+    def datasets(self):
+        for name in self.dataset_names():
+            yield self.get_dataset(name)
 
-        entry   = self._info
-        keypath = keypath.split(SEP)
-        # traverse to the deepest entry
-        for key in keypath[:-1]:
-            if key not in entry.keys():
-                entry[key] = _OrderedDict()
-            entry = entry[key]
-        if value == DELETE_KEY:
-            del entry[keypath[-1]]
-            debug(f"AbstractInterface._update_info: `rm` {repr(keypath)}")
-        else:
-            entry[keypath[-1]] = value
-            debug(f"AbstractInterface._update_info: {repr(keypath)} <- {repr(value)}")
-        if write == True:
-            self.store_info()
+    def items(self):
+        for name in self.keys():
+            yield name, self.__getitem__(name)
 
     def get_entry(self, name, create=True):
         """returns the specified child entry.
         if `create` is True and the entry does not exist,
         the entry is newly generated before being returned."""
-        if name in self.children():
+        if name in self.child_names():
             entry = self._get_child_entry(name)
         else:
             if create == False:
@@ -252,7 +385,7 @@ class AbstractInterface:
 
     def put_entry(self, name, entry, overwrite=True, deletesource=False):
         """puts `entry` to this entry with `name`."""
-        if name in self.children():
+        if name in self.child_names():
             if overwrite == False:
                 raise NameError(f"entry '{name}' already exists")
             else:
@@ -261,11 +394,11 @@ class AbstractInterface:
         # copy recursively
         child = self.get_entry(name, create=True)
         child._info.update(entry._info)
-        for dataname in entry.datasets():
+        for dataname in entry.dataset_names():
             child.put_dataset(dataname, entry.get_dataset(dataname))
-        for grandchild in entry.children():
+        for grandchild in entry.child_names():
             child.put_entry(grandchild, entry.get_entry(grandchild))
-        child.store_info()
+        child._store_info()
 
         if deletesource == True:
             if entry._parent is None:
@@ -276,14 +409,14 @@ class AbstractInterface:
 
     def delete_entry(self, name):
         """deletes a child entry with 'name' from this entry."""
-        if name not in self.children():
+        if name not in self.child_names():
             raise NameError(f"entry '{name}' does not exist")
         child = self.get_entry(name, create=False)
 
         # deletes grandchildren recursively
-        for dataname in entry.datasets():
+        for dataname in child.dataset_names():
             child.delete_dataset(dataname)
-        for grandchild in child.children():
+        for grandchild in child.child_names():
             child.delete_entry(grandchild)
         child._delete_info()
 
@@ -292,26 +425,60 @@ class AbstractInterface:
 
     def get_dataset(self, name):
         """returns the dataset with the specified name."""
-        if name not in self.datasets():
+        if name not in self.dataset_names():
             raise NameError(f"dataset not found: {name}")
-        return self._load_child_dataset(name)
+        data = self._load_child_dataset(name)
+        locked = self.attrs.lock()
+        self.attrs[f".datasets/{name}/dtype"] = str(data.dtype)
+        self.attrs[f".datasets/{name}/shape"] = data.shape
+        if locked == True:
+            self.attrs.commit()
+        return data
 
     def put_dataset(self, name, value, overwrite=True):
         """puts `value` to this entry with `name`."""
-        if name in self.datasets():
+        if name in self.dataset_names():
             if overwrite == False:
                 raise NameError(f"the dataset '{name}' already exists")
             else:
                 self.delete_dataset(name, writeinfo=False)
         self._store_child_dataset(name, value)
-        self._update_info(f".datasets/{name}/dtype", str(value.dtype), write=False)
-        self._update_info(f".datasets/{name}/shape", value.shape, write=True)
+        locked = self.attrs.lock()
+        self.attrs[f".datasets/{name}/dtype"] = str(value.dtype)
+        self.attrs[f".datasets/{name}/shape"] = value.shape
+        if locked == True:
+            self.attrs.commit()
 
-    def delete_dataset(self, name, writeinfo=True):
+    def put_namedtuple_struct(self, name, value, overwrite=True):
+        if not is_namedtuple_struct(value):
+            raise ValueError(f"not conforming to the 'named-tuple structure': {value.__class__}")
+        if name in self.child_names():
+            if overwrite == False:
+                raise NameError(f"the entry '{name}' already exists")
+            else:
+                self.delete_entry(name, writeinfo=False)
+        entry = self.get_entry(name, create=True)
+        locked = entry.attrs.lock()
+        entry.attrs["type"] = value.__class__.__name__
+        for field in value._fields:
+            item = getattr(value, field)
+            if isinstance(item, INFO_TYPES):
+                entry.attrs[field] = item
+            else:
+                # must be np.ndarray b/c of is_namedtuple_struct() impl
+                entry.put_dataset(field, item, overwrite=True)
+        if locked == True:
+            entry.attrs.commit()
+
+    def delete_dataset(self, name):
         """deletes a child dataset with 'name' from this entry."""
         self._delete_child_dataset(name)
-        self._update_info(f".datasets/{name}/dtype", DELETE_KEY, write=writeinfo)
-        self._update_info(f".datasets/{name}/shape", DELETE_KEY, write=writeinfo)
+
+        locked = self.attrs.lock()
+        del self.attrs[f".datasets/{name}/dtype"]
+        del self.attrs[f".datasets/{name}/shape"]
+        if locked == True:
+            self.attrs.commit()
 
 class FileSystemInterface(AbstractInterface):
     """base class that provides a file system-based data access.
@@ -319,27 +486,30 @@ class FileSystemInterface(AbstractInterface):
     it proides implementations for some abstract functions in AbstractInterface:
 
     - `open`
-    - `_get_repr`
+    - `_get_volatile_repr`
     - `_list_contents`
     - `_load_info`
     - `_store_info`
     - `_delete_info`
     - `_store_child_entry`
     - `_delete_child_entry`
+    - `_delete_child_dataset`
 
     subclasses still needs to implement the following methods:
 
     - `_data_suffix`: to distinguish dataset file from the other child entries.
     - `_load_child_dataset`: to deserialize datasets into numpy.ndarrays.
     - `_store_child_dataset`: to serialize numpy.ndarrays.
-    - `_delete_child_dataset`: to remove datasets from the storage.
 
     """
 
     _info_suffix = ".json"
     _data_suffix = None
 
-    def _get_repr(self, parent, name):
+    def _datafile(self, name):
+        return self._repr / f"{name}{self._data_suffix}"
+
+    def _get_volatile_repr(self, parent, name):
         if parent is None:
             # root; necessary paths must have been already initialized
             return
@@ -350,7 +520,7 @@ class FileSystemInterface(AbstractInterface):
             raise FileExistsError("cannot create another entry (file in place of directory)")
         if not file.exists():
             file.mkdir()
-            debug(f"AbstractInterface._get_repr: created '{name}' under '{str(parent)}'")
+            debug(f"FileSystemInterface._get_volatile_repr: created '{name}' under '{str(parent)}'")
         return file
 
     def _load_info(self):
@@ -413,14 +583,13 @@ class FileSystemInterface(AbstractInterface):
         suffix, if you use the `_data_suffix` functionality)."""
         pass
 
-    @abstractmethod
     def _delete_child_dataset(self, name):
         """removes the dataset that has `name` (with appropriate suffix,
         if you use the `_data_suffix` functionality)."""
-        pass
+        self._datafile(name).unlink()
 
     @classmethod
-    def _root_repr(cls, rootpath):
+    def _open_root_repr(cls, rootpath):
         rootrepr = _pathlib.Path(rootpath)
         if not rootrepr.exists():
             created = True
@@ -429,6 +598,10 @@ class FileSystemInterface(AbstractInterface):
             created = False
         return created, rootrepr
 
+    @classmethod
+    def _free_root_repr(cls, rootrepr):
+        pass
+
 
 class NPYInterface(FileSystemInterface):
     _data_suffix = '.npy'
@@ -436,17 +609,34 @@ class NPYInterface(FileSystemInterface):
     def __init__(self, name, parent=None):
         super().__init__(name, parent=parent)
 
-    def __datafile(self, name):
-        return self._repr / f"{name}.npy"
-
     def _load_child_dataset(self, name):
-        data = _np.load(str(self.__datafile(name)))
-        self._update_info(f".datasets/{name}/dtype", str(data.dtype), write=False)
-        self._update_info(f".datasets/{name}/shape", data.shape, write=True)
+        data = _np.load(str(self._datafile(name)))
         return data
 
     def _store_child_dataset(self, name, value):
-        _np.save(str(self.__datafile(name)), value)
+        _np.save(str(self._datafile(name)), value)
 
-    def _delete_child_dataset(self, name):
-        self.__datafile(name).unlink()
+class BareZInterface(FileSystemInterface):
+    _data_suffix = ".zarr"
+    _default_compression_level = 6
+    compression_level = None
+
+    def __init__(self, name, parent=None):
+        super().__init__(name, parent=parent)
+        if parent is not None:
+            if hasattr(parent, 'compression_level'):
+                self.compression_level = parent.compression_level
+        if self.compression_level is None:
+            self.compression_level = self._default_compression_level
+
+    def _load_child_dataset(self, name):
+        dtype = _np.dtype(self.attrs[f".datasets/{name}/dtype"])
+        shape = self.attrs[f".datasets/{name}/shape"]
+        file  = str(self._datafile(name))
+        with open(file, 'rb') as src:
+            binary = _zlib.decompress(str.read())
+        return _np.frombuffer(binary, dtype=dtype).reshape(shape, order='C')
+
+    def _store_child_dataset(self, name, value):
+        with open(self._datafile(name), 'wb') as dst:
+            dst.write(_zlib.compress(value.tobytes(order='C'), level=self.compression_level))
