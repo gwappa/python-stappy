@@ -33,7 +33,7 @@ import numpy as _np
 TODO: deal with endian-ness...
 """
 
-VERSION_STR = "0.0.1"
+VERSION_STR = "0.0.2"
 DEBUG       = False
 
 SEP         = '/'
@@ -63,6 +63,7 @@ class AttributeManager:
         if self._updating == True:
             return False
         self._updating  = True
+        return True
 
     def flag(self):
         if self._updating  == True:
@@ -97,7 +98,7 @@ class AttributeManager:
 
     def __setitem__(self, keypath, value):
         entry, key = self.__resolve_keypath(keypath, create=True)
-        entry[keypath[-1]] = value
+        entry[key] = value
         debug(f"AttributeManager: {repr(keypath)} <- {repr(value)}")
         self.flag()
 
@@ -118,7 +119,7 @@ class AttributeManager:
                 else:
                     raise KeyError(key)
             entry = entry[key]
-        return entry, key[-1]
+        return entry, keypath[-1]
 
 class AbstractInterface:
     """base class that provides common functionality.
@@ -456,7 +457,7 @@ class AbstractInterface:
             if overwrite == False:
                 raise NameError(f"the entry '{name}' already exists")
             else:
-                self.delete_entry(name, writeinfo=False)
+                self.delete_entry(name)
         entry = self.get_entry(name, create=True)
         locked = entry.attrs.lock()
         entry.attrs["type"] = value.__class__.__name__
