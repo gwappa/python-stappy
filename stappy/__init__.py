@@ -33,7 +33,7 @@ import numpy as _np
 TODO: deal with endian-ness...
 """
 
-VERSION_STR = "0.0.2"
+VERSION_STR = "0.0.3"
 DEBUG       = False
 
 SEP         = '/'
@@ -50,8 +50,11 @@ def abstractmethod(meth):
     return __invalid_call__
 
 def is_namedtuple_struct(obj):
-    return isinstance(obj, tuple) and hasattr(obj, '_fields') \
-            and all(isinstance(item,  INFO_TYPES + (_np.ndarray,)) for item in obj)
+    if isinstance(obj, tuple):
+        if hasattr(obj, '_fields'):
+            if all(isinstance(getattr(obj, fld),  INFO_TYPES + (_np.ndarray,)) for fld in obj._fields):
+                return True
+    return False
 
 class AttributeManager:
     def __init__(self, interface):
@@ -301,13 +304,16 @@ class AbstractInterface:
             raise KeyError(key)
 
     def __setitem__(self, keypath, value):
-        if not isinstance(value, (AbstractInterface, _np.ndarray)):
-            raise ValueError("stappy interface only accepts entry-types or numpy arrays")
+        if (not isinstance(value, (AbstractInterface, _np.ndarray))) \
+            and (not is_namedtuple_struct(value)):
+            raise ValueError(f"stappy only accepts entry-types, numpy arrays or array-based named tuples, but got {value.__class__}")
         entry, key = self.resolve_path(keypath, create=True)
         if isinstance(value, AbstractInterface):
             entry.put_entry(key, value)
         elif isinstance(value, _np.ndarray):
             entry.put_dataset(key, value)
+        elif is_namedtuple_struct(value):
+            entry.put_namedtuple_struct(key, value)
         else:
             raise RuntimeError("fatal error: class assertion failed")
 
@@ -321,6 +327,17 @@ class AbstractInterface:
             entry.delete_dataset(key)
         else:
             raise KeyError(key)
+
+    def __contains__(self, keypath):
+        try:
+            entry, key = self.resolve_path(keypath, create=False)
+        except KeyError:
+            return False
+        try:
+            entry = entry.get_entry(key, create=False)
+            return True
+        except NameError:
+            return False
 
     def resolve_path(self, keypath, create=True):
         """returns (dparent, key), where `dparent` indicates the
@@ -442,7 +459,7 @@ class AbstractInterface:
             if overwrite == False:
                 raise NameError(f"the dataset '{name}' already exists")
             else:
-                self.delete_dataset(name, writeinfo=False)
+                self.delete_dataset(name)
         self._store_child_dataset(name, value)
         locked = self.attrs.lock()
         self.attrs[f".datasets/{name}/dtype"] = str(value.dtype)
