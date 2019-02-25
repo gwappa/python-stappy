@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import sys as _sys
 import pathlib as _pathlib
 import json as _json
 import zlib as _zlib
@@ -28,12 +29,14 @@ from functools import wraps
 
 import numpy as _np
 
-"""stappy -- a storage-access protocol in python.
+"""
+stappy -- a storage-access protocol in python.
 
-TODO: deal with endian-ness...
+currently byte-order (i.e. endian-ness) support is write-only.
+`stappy` does not support reading dataset that differ from native byte order.
 """
 
-VERSION_STR = "0.0.3"
+VERSION_STR = "0.0.4"
 DEBUG       = False
 
 SEP         = '/'
@@ -57,6 +60,7 @@ def is_namedtuple_struct(obj):
     return False
 
 class AttributeManager:
+    """interface for editing entry attributes."""
     def __init__(self, interface):
         self._interface = interface
         self._updating  = False
@@ -124,6 +128,38 @@ class AttributeManager:
             entry = entry[key]
         return entry, keypath[-1]
 
+class EntryCreation:
+    """utility interface for creating entries. called as AbstractInterface.create[<keypath>]."""
+    def __init__(self, interface):
+        self._interface = interface
+
+    def __getitem__(self, keypath):
+        entry, key = self._interface.resolve_path(keypath, create=True)
+        if key in entry.dataset_names():
+            return entry.get_dataset(key)
+        else:
+            return entry.get_entry(key, create=True)
+
+    def __setitem__(self, keypath, value):
+        raise NotImplementedError("use AbstractInterface[<keypath>] to modify entries/datasets")
+
+class EntryRetrieval:
+    """utility interface for retrieving entries. called as AbstractInterface.get[<keypath>]."""
+    def __init__(self, interface):
+        self._interface = interface
+
+    def __getitem__(self, keypath):
+        entry, key = self._interface.resolve_path(keypath, create=False)
+        if key in entry.dataset_names():
+            return entry.get_dataset(key)
+        elif key in entry.child_names():
+            return entry.get_entry(key, create=False)
+        else:
+            raise KeyError(key)
+
+    def __setitem__(self, keypath, value):
+        raise NotImplementedError("use AbstractInterface[<keypath>] to modify entries/datasets")
+
 class AbstractInterface:
     """base class that provides common functionality.
 
@@ -154,6 +190,12 @@ class AbstractInterface:
     """
     _info_suffix = ".json"
     _data_suffix = None
+    _byteorders = {
+        '<': 'little',
+        '>': 'big',
+        '=': _sys.byteorder,
+        '|': 'NA'
+    }
 
     @classmethod
     def _open_root_repr(cls, rootpath):
@@ -293,6 +335,14 @@ class AbstractInterface:
             return f"{self.__class__.__name__}({repr(str(self._root))})[{repr(str(self._path))}]"
         else:
             return f"{self.__class__.__name__}(#invalid)"
+
+    def __getattr__(self, name):
+        if name == 'create':
+            return EntryCreation(self)
+        elif name == 'get':
+            return EntryRetrieval(self)
+        else:
+            return super().__getattr__(name)
 
     def __getitem__(self, keypath):
         entry, key = self.resolve_path(keypath, create=False)
@@ -447,8 +497,9 @@ class AbstractInterface:
             raise NameError(f"dataset not found: {name}")
         data = self._load_child_dataset(name)
         locked = self.attrs.lock()
-        self.attrs[f".datasets/{name}/dtype"] = str(data.dtype)
-        self.attrs[f".datasets/{name}/shape"] = data.shape
+        self.attrs[f".datasets/{name}/dtype"]       = str(data.dtype)
+        self.attrs[f".datasets/{name}/shape"]       = data.shape
+        self.attrs[f".datasets/{name}/byteorder"]   = self._byteorders[data.dtype.byteorder]
         if locked == True:
             self.attrs.commit()
         return data
@@ -464,6 +515,7 @@ class AbstractInterface:
         locked = self.attrs.lock()
         self.attrs[f".datasets/{name}/dtype"] = str(value.dtype)
         self.attrs[f".datasets/{name}/shape"] = value.shape
+        self.attrs[f".datasets/{name}/byteorder"]   = self._byteorders[data.dtype.byteorder]
         if locked == True:
             self.attrs.commit()
 
@@ -656,5 +708,6 @@ class BareZInterface(FileSystemInterface):
         return _np.frombuffer(binary, dtype=dtype).reshape(shape, order='C')
 
     def _store_child_dataset(self, name, value):
+        self.attrs[f".datasets/{name}/compression"] = 'zlib'
         with open(self._datafile(name), 'wb') as dst:
             dst.write(_zlib.compress(value.tobytes(order='C'), level=self.compression_level))
