@@ -34,9 +34,37 @@ stappy -- a storage-access protocol in python.
 
 currently byte-order (i.e. endian-ness) support is write-only.
 `stappy` does not support reading dataset that differ from native byte order.
+
+TODO:
+
+BIDS may need to be supported.
+
+it may have been a bad idea to prepare "get/put/delete_xxx" for all types of data.
+should work like e.g.:
+
+```
+base.create["path/to/entry"]
+base["path/to/entry"].dataset["name"]  = data
+base["path/to/entry"].table["name"]    = table
+base["path/to/entry"].keyvalue["name"] = mapped
+```
+
+Ideally, these virtual attributes could be used ad hoc e.g. by calling:
+
+```
+class SubInterface(AbstractInterface):
+    def __getdata__(self, name, type):
+        ...
+
+    def __setdata__(self, name, type, value):
+        ...
+
+    def __deldata__(self, name, type):
+        ...
+```
 """
 
-VERSION_STR = "0.0.4"
+VERSION_STR = "0.0.5"
 DEBUG       = False
 
 SEP         = '/'
@@ -265,6 +293,18 @@ class AbstractInterface:
     @abstractmethod
     def _delete_child_dataset(self, name):
         """remove the dataset that has `name`."""
+        pass
+
+    @abstractmethod
+    def _load_child_dict(self, name):
+        pass
+
+    @abstractmethod
+    def _store_child_dict(self, name):
+        pass
+
+    @abstractmethod
+    def _delete_child_dict(self, name):
         pass
 
     @classmethod
@@ -497,9 +537,9 @@ class AbstractInterface:
             raise NameError(f"dataset not found: {name}")
         data = self._load_child_dataset(name)
         locked = self.attrs.lock()
-        self.attrs[f".datasets/{name}/dtype"]       = str(data.dtype)
-        self.attrs[f".datasets/{name}/shape"]       = data.shape
-        self.attrs[f".datasets/{name}/byteorder"]   = self._byteorders[data.dtype.byteorder]
+        self.attrs[f"{name}/dtype"]       = str(data.dtype)
+        self.attrs[f"{name}/shape"]       = data.shape
+        self.attrs[f"{name}/byteorder"]   = self._byteorders[data.dtype.byteorder]
         if locked == True:
             self.attrs.commit()
         return data
@@ -513,9 +553,9 @@ class AbstractInterface:
                 self.delete_dataset(name)
         self._store_child_dataset(name, value)
         locked = self.attrs.lock()
-        self.attrs[f".datasets/{name}/dtype"] = str(value.dtype)
-        self.attrs[f".datasets/{name}/shape"] = value.shape
-        self.attrs[f".datasets/{name}/byteorder"]   = self._byteorders[data.dtype.byteorder]
+        self.attrs[f"{name}/dtype"] = str(value.dtype)
+        self.attrs[f"{name}/shape"] = value.shape
+        self.attrs[f"{name}/byteorder"]   = self._byteorders[data.dtype.byteorder]
         if locked == True:
             self.attrs.commit()
 
@@ -545,10 +585,22 @@ class AbstractInterface:
         self._delete_child_dataset(name)
 
         locked = self.attrs.lock()
-        del self.attrs[f".datasets/{name}/dtype"]
-        del self.attrs[f".datasets/{name}/shape"]
+        del self.attrs[f"{name}/dtype"]
+        del self.attrs[f"{name}/shape"]
+        del self.attrs[f"{name}/byteorder"]
         if locked == True:
             self.attrs.commit()
+
+    def get_dict(self, name):
+        return self._load_child_dict(name)
+
+    def put_dict(self, name, value):
+        if not isinstance(value, (dict, _OrderedDict)): # FIXME: how to check if it is mapping type?
+            raise ValueError(f"expected dict, got '{value.__class__}'")
+        self._store_child_dict(name, value)
+
+    def delete_dict(self, name):
+        self._delete_child_dict(name)
 
 class FileSystemInterface(AbstractInterface):
     """base class that provides a file system-based data access.
@@ -573,6 +625,7 @@ class FileSystemInterface(AbstractInterface):
 
     """
 
+    _meta_base   = "entry_metadata"
     _info_suffix = ".json"
     _data_suffix = None
 
@@ -593,8 +646,26 @@ class FileSystemInterface(AbstractInterface):
             debug(f"FileSystemInterface._get_volatile_repr: created '{name}' under '{str(parent)}'")
         return file
 
+    def _load_child_dict(self, name):
+        dictfile = self._repr / f"{name}.json"
+        if not dictfile.exists():
+            raise FileNotFoundError(str(dictfile))
+        else:
+            with open(dictfile, 'r') as src:
+                return _json.load(src, object_hook=_OrderedDict)
+
+    def _store_child_dict(self, name, value):
+        dictfile = self._repr / f"{name}.json"
+        with open(dictfile, 'w') as out:
+            _json.dump(value, out, indent=4)
+
+    def _delete_child_dict(self, name):
+        dictfile = self._repr / f"{name}.json"
+        if dictfile.exists():
+            dictfile.unlink()
+
     def _load_info(self):
-        infofile = self._repr / f"entryinfo{self._info_suffix}"
+        infofile = self._repr / f"{self._meta_base}{self._info_suffix}"
         if not infofile.exists():
             debug(f"FileSystemInterface._load_info: {repr(str(infofile))} was not found; leave the info empty.")
             self._info = _OrderedDict()
@@ -605,12 +676,12 @@ class FileSystemInterface(AbstractInterface):
 
     def _store_info(self):
         if len(self._info) > 0:
-            with open(self._repr / f"entryinfo{self._info_suffix}", 'w') as out:
+            with open(self._repr / f"{self._meta_base}{self._info_suffix}", 'w') as out:
                 _json.dump(self._info, out, indent=4)
             debug(f"FileSystemInterface._store_info: stored into '{self._name}': '{self._info}'")
 
     def _delete_info(self):
-        infofile = self._repr / f"entryinfo{self._info_suffix}"
+        infofile = self._repr / f"{self._meta_base}{self._info_suffix}"
         if not infofile.exists():
             return
         else:
@@ -700,14 +771,14 @@ class BareZInterface(FileSystemInterface):
             self.compression_level = self._default_compression_level
 
     def _load_child_dataset(self, name):
-        dtype = _np.dtype(self.attrs[f".datasets/{name}/dtype"])
-        shape = self.attrs[f".datasets/{name}/shape"]
+        dtype = _np.dtype(self.attrs[f"{name}/dtype"])
+        shape = self.attrs[f"{name}/shape"]
         file  = str(self._datafile(name))
         with open(file, 'rb') as src:
             binary = _zlib.decompress(str.read())
         return _np.frombuffer(binary, dtype=dtype).reshape(shape, order='C')
 
     def _store_child_dataset(self, name, value):
-        self.attrs[f".datasets/{name}/compression"] = 'zlib'
+        self.attrs[f"{name}/compression"] = 'zlib'
         with open(self._datafile(name), 'wb') as dst:
             dst.write(_zlib.compress(value.tobytes(order='C'), level=self.compression_level))
