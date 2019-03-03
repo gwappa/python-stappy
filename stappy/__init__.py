@@ -44,9 +44,12 @@ should work like e.g.:
 
 ```
 base.create["path/to/entry"]
-base["path/to/entry"].dataset["name"]  = data
-base["path/to/entry"].table["name"]    = table
-base["path/to/entry"].keyvalue["name"] = mapped
+base["path/to/entry"].dataset["name"]    = data
+# or: base.dataset["path/to/entry/name"] = data
+
+base["path/to/entry"].table["name"]      = table
+base["path/to/entry"].keyvalue["name"]   = mapped
+base["path/to/entry"].namedtuple["name"] = value
 ```
 
 Ideally, these virtual attributes could be used ad hoc e.g. by calling:
@@ -64,7 +67,7 @@ class SubInterface(AbstractInterface):
 ```
 """
 
-VERSION_STR = "0.0.5"
+VERSION_STR = "0.5"
 DEBUG       = False
 
 SEP         = '/'
@@ -86,6 +89,12 @@ def is_namedtuple_struct(obj):
             if all(isinstance(getattr(obj, fld),  INFO_TYPES + (_np.ndarray,)) for fld in obj._fields):
                 return True
     return False
+
+def is_mapping(obj):
+    for attr in ('keys', 'values', 'items', '__getitem__'):
+        if not hasattr(obj, attr) or not callable(getattr(obj, attr)):
+            return False
+    return True
 
 class AttributeManager:
     """interface for editing entry attributes."""
@@ -395,8 +404,8 @@ class AbstractInterface:
 
     def __setitem__(self, keypath, value):
         if (not isinstance(value, (AbstractInterface, _np.ndarray))) \
-            and (not is_namedtuple_struct(value)):
-            raise ValueError(f"stappy only accepts entry-types, numpy arrays or array-based named tuples, but got {value.__class__}")
+            and (not is_namedtuple_struct(value)) and (not is_mapping(value)):
+            raise ValueError(f"stappy only accepts entry-types, numpy arrays, array-based named tuples, or mappings, but got {value.__class__}")
         entry, key = self.resolve_path(keypath, create=True)
         if isinstance(value, AbstractInterface):
             entry.put_entry(key, value)
@@ -404,6 +413,8 @@ class AbstractInterface:
             entry.put_dataset(key, value)
         elif is_namedtuple_struct(value):
             entry.put_namedtuple_struct(key, value)
+        elif is_mapping(value):
+            entry.put_dict(key, value)
         else:
             raise RuntimeError("fatal error: class assertion failed")
 
@@ -555,7 +566,7 @@ class AbstractInterface:
         locked = self.attrs.lock()
         self.attrs[f"{name}/dtype"] = str(value.dtype)
         self.attrs[f"{name}/shape"] = value.shape
-        self.attrs[f"{name}/byteorder"]   = self._byteorders[data.dtype.byteorder]
+        self.attrs[f"{name}/byteorder"]   = self._byteorders[value.dtype.byteorder]
         if locked == True:
             self.attrs.commit()
 
