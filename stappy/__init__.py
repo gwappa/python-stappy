@@ -786,7 +786,7 @@ class BareZInterface(FileSystemInterface):
         shape = self.attrs[f"{name}/shape"]
         file  = str(self._datafile(name))
         with open(file, 'rb') as src:
-            binary = _zlib.decompress(str.read())
+            binary = _zlib.decompress(src.read())
         return _np.frombuffer(binary, dtype=dtype).reshape(shape, order='C')
 
     def _store_child_dataset(self, name, value):
