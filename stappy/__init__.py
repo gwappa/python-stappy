@@ -49,7 +49,7 @@ base["path/to/entry"].dataset["name"]    = data
 
 base["path/to/entry"].table["name"]      = table
 base["path/to/entry"].keyvalue["name"]   = mapped
-base["path/to/entry"].namedtuple["name"] = value
+base["path/to/entry"].image["name"]      = img
 ```
 
 Ideally, these virtual attributes could be used ad hoc e.g. by calling:
@@ -95,6 +95,424 @@ def is_mapping(obj):
         if not hasattr(obj, attr) or not callable(getattr(obj, attr)):
             return False
     return True
+
+def infer_format(value):
+    """infers data format from the object type of `value`."""
+    pass
+
+class PathFormat:
+    sep     = '/'
+    parent  = '..'
+    current = '.'
+
+    @classmethod
+    def to_string(cls, path):
+        return cls.sep + cls.sep.join(self._path)
+
+    @classmethod
+    def from_string(cls, pathrepr):
+        return pathrepr.split(cls.sep)
+
+    @classmethod
+    def compute_name(cls, path):
+        if len(path) == 0:
+            return None
+        else:
+            return path[-1]
+
+    @classmethod
+    def compute_parent(cls, path):
+        if len(path) == 0:
+            return tuple()
+        else:
+            return tuple(path[:-1])
+
+    @classmethod
+    def concatenate(cls, basepath, additions):
+        if isinstance(additions, str):
+            additions = cls.from_string(additions)
+        path = basepath
+        for elem in additions:
+            if len(elem) == 0:
+                raise ValueError('cannot concatenate a zero-length path component.')
+            elif elem == cls.parent:
+                path = cls.compute_parent(path)
+            elif elem == cls.current:
+                pass
+            else:
+                path = path + (elem,)
+        return path
+
+class Structure:
+    """the base interface for structured database access."""
+    create_attribute_default = False
+
+    def __init__(self, path, context=None):
+        if context is None:
+            raise ValueError("context cannot be None")
+        self._path    = path
+        self._context = context
+
+    def __repr__(self):
+        cls = self.__class__.__name__
+        cxt = self._context.get_repr()
+        pathrepr = PathFormat.to_string(self._path)
+        return f"{cls}{cxt}[{repr(pathrepr)}]"
+
+    def __getitem__(self, path):
+        return self.__class__(PathFormat.concatenate(self._path, path), self._context)
+
+    def __getattr__(self, name):
+        if name == 'parent':
+            return self.__class__(PathFormat.compute_parent(self._path), self._context)
+        elif name == 'attr':
+            return self._context.get_attribute_root(self._path, create=create_attribute_default)
+        elif name == 'format':
+            return self._context.get_format(self._path)
+        elif name == 'name':
+            return PathFormat.compute_name(self._path)
+        else:
+            raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        # TODO: may be settable for 'name' or 'format'
+        cls = self.__class__.__name__
+        raise RuntimeError(f"cannot use bracket-form set methods for {cls}"+
+                        f" (use {cls}.store() instead)")
+
+    def exists(self, format=None):
+        """returns if any entry exists at this path (with the specified format(s),
+        or None without specification)."""
+        return self._context.entry_exists(self._path, format=format)
+
+    def create(self, parents=True):
+        """create a group that has the corresponding path."""
+        self._context.create_group(self._path, parents=parents)
+        return self
+
+    def load(self, format='infer'):
+        """retrieves the content of this entry."""
+        if (format is None) or (format == 'infer'):
+            format = self._context.get_format(self._path)
+        return self._context.get_value(self, format=format)
+
+    def store(self, value, format='infer', parents=True):
+        """stores the value as the content of this entry."""
+        if (format is None) or (format == 'infer'):
+            format = infer_format(value)
+        self._context.set_value(self._path, value, format=format, parents=parents)
+
+    def keys(self, format=None):
+        """iterates child names (with or without specified format(s))."""
+        return self._context.child_names(self._path, format=format)
+
+    def values(self, format=None, unwrap=False):
+        """returns a generator that iterates child values (with or without specified format(s)).
+
+        if `unwrap` is True, `entry.load()` is called for each of children."""
+        for name in self._context.child_names(self._path, format=format):
+            entry = self[name]
+            if unwrap == True:
+                entry = entry.load()
+            yield entry
+
+    def items(self, format=None, as_path=False, unwrap=False):
+        """returns a generator that iterates child names/values (with or without specified format).
+
+        if `unwrap` is True, `entry.load()` is called for each of children.
+        if `as_path` is True, child names are given as the path tuple from the context root.
+        """
+        for name in self._context.child_names(self._path, format=format):
+            entry = self[name]
+            if as_path == True:
+                path = entry._path
+            else:
+                path = name
+            if unwrap == True:
+                entry = entry.load()
+            yield path, entry
+
+class Context:
+    """the base class defining the structure context.
+    e.g. EntryContext defines the context for 'proper' database context,
+    whereas AttributeContext defines the context for attriubtes of entries."""
+    name    = None
+
+    @abstractmethod
+    def get_attribute_root(self, path, create=False):
+        """returns the root attribute context for the entry at the path.
+
+        if `create` is True, it creates the base entry whenever `entry_exists` returns False.
+        for attribute contexts, this method likely raises a RuntimeError."""
+        pass
+
+    @abstractmethod
+    def get_repr(self):
+        """returns a proper representation of this context that can be used
+        for repr(Structure)"""
+        pass
+
+    @abstractmethod
+    def entry_exists(self, path, format=None):
+        """returns if an entry exists at path (with or without specified formats)."""
+        pass
+
+    @abstractmethod
+    def get_format(self, path):
+        """returns the format of the entry at the path"""
+        pass
+
+    @abstractmethod
+    def create_group(self, path, parents=True):
+        """creates a data group at path. if `parents` is True, calling this also
+        creates any missing parent groups."""
+        pass
+
+    @abstractmethod
+    def get_value(self, path, format=None):
+        """load a data at path (with or without specified formats)."""
+        pass
+
+    @abstractmethod
+    def set_value(self, path, value, format=None, parents=True):
+        """stores a value at path (with or without specified formats)."""
+        if (format is None) or (format == 'infer'):
+            format = infer_format(value)
+        pass
+
+    @abstractmethod
+    def child_names(self, path, format=None):
+        """iterates names of child entries (if any) under this path."""
+        pass
+
+class Transaction:
+    """represents the locked state to a context."""
+    def __init__(self, context):
+        self._context = context
+        self._marked  = False
+        self._context._transaction = self
+
+    def mark(self):
+        """flags this transaction 'dirty'."""
+        self._marked  = True
+
+    def commit(self):
+        if self._marked == True:
+            self._context.writeall()
+            self._marked = False
+
+    def rollback(self):
+        if self._marked == True:
+            self._context.readall()
+            self._marked = False
+
+class __Context:
+    """abstract context structure for dealing with raw driver, apart from the
+    default database-traversal functionality.
+
+    For example, the Context object for 'dataset' will be generated
+    when one calls as follows:
+
+    ```
+    data.dataset["path/to/dataset"]
+    ```
+
+    Scope and format
+    ----------------
+
+    Each Context object works with `scope` and `format`,
+    where `format` being one of (DATASET, TABLE, IMAGE, KEYVALUE, ATTRS),
+    and `scope` being the internal path of the context within the database.
+
+    Upon retrieval/updating the objects within the context, the Context object
+    supplies the parent driver interface with its corresponding `scope` and
+    `format` info, along with the method call.
+
+    Every root instance can specify the exact implementation of `scope`.
+
+    The method calls for driver instance include:
+
+    - `children()``
+    - `read()`
+    - `write()`
+    - `subscope()`
+    - `readall()`
+    - `writeall()`
+    - `lock()`
+    - `unlock()`
+
+    Note that the transaction supports on `read` and `write` methods depend on
+    individual database implementations. Some database may be able to make all
+    reads/writes atomic during a transaction; others may only support such atomic
+    I/O for part of the formats; the rest may totally ignore transaction-related
+    features (in which cases it is encouraged to emit warnings).
+
+    Path spec and scope
+    -------------------
+
+    `root` as it is specified in Context's initializer refers to the "root object"
+    that handles the path specification.
+    In other words, if you have two different path specs in
+    your database, then the `root` object can differ depending on it.
+
+    For example, in h5py, you would write as follows:
+
+    ```
+    with h5py.File('your.hdf5', 'r') as src:
+        src["path/to/group"].attrs["attribute/path"] = "comment"
+    ```
+
+    Here the path space for `"path/to/group"` and that for `"attribute/path"`
+    is different (in a sense `src["path/to/group/attribute"].attrs["path"]` does
+    not refer to a same data).
+
+    For the former part of the path spec, `src` is the root object for the path;
+    for the latter part, `src["path/to/group"].attrs` is the root object.
+
+    On the other hand, the "path" part specifies the 'scope' of the context.
+    For example, 'scope' for `src["path/to/group"]` is `"path/to/group"`.
+
+    Instantiation of concrete data items
+    ------------------------------------
+
+    `Context` works like `pathlib.Path` objects in a sense that existence of a
+    `Context` object does not imply the existence of corresponding physical entity.
+
+    Entry creation / retrieval occurs *only when* either of `read` or `write` calls
+    occurs.
+
+    ContextManager style
+    --------------------
+
+    `with` statements can be used with or without `lock()`ing.
+    If the database is locked using this Context object, the lock object will be
+    automatically released as the procedures exits from the `with` block.
+
+    """
+
+    NONE      = 'none'
+    GROUPS    = 'create'
+    DATASET   = 'dataset'
+    TABLE     = 'table'
+    IMAGE     = 'image'
+    KEYVALUE  = 'keyvalue'
+    ATTRIBUTE = 'attrs'
+
+    available = (DATASET, TABLE, IMAGE, KEYVALUE, ATTRS)
+
+    def __init__(self, root, scope, format='none', sep=SEP, transaction=None):
+        self._root          = root
+        self._scope         = scope
+        self._format        = format
+        self._sep           = sep
+        self._transaction   = transaction
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._transaction is not None:
+            if exc_type is None:
+                self._transaction.commit()
+            else:
+                self._transaction.rollback()
+            self.unlock(transaction=self._transaction)
+
+    def __getitem__(self, keypath):
+        entry, key = self.resolve(keypath)
+        return entry.read()
+
+    def __setitem__(self, keypath, value):
+        entry, key = self.resolve(keypath)
+        debug(f"{self.__class__.__name__}: {repr(keypath)} <- {repr(value)}")
+        entry.write(value)
+
+    def copy(self, root=None, scope=None, format=None,
+                    sep=None, transaction=None):
+        return self.__class__(  root=self._root if root is None else root,
+                                scope=self._scope if scope is None else scope,
+                                format=self._format if format is None else format,
+                                sep=self._sep if sep is None else sep,
+                                transaction=self._transaction if transaction is None else transaction)
+
+    def keys(self):
+        """retrieves list of names associated with this format directly within this context."""
+        return self._root.children(contexts=[self], keys=True, values=False)
+
+    def values(self):
+        """retrieves list of values associated with this format directly within this context."""
+        return self._root.children(contexts=[self], keys=False, values=False)
+
+    def items(self):
+        return self._root.children(contexts=[self], keys=True, value=True)
+
+    def read(self, contexts=None):
+        """retrieve the content of this context."""
+        if contexts is None:
+            contexts = [self]
+        else:
+            contexts.append(self)
+        return self._root.read(contexts=contexts)
+
+    def write(self, value, contexts=None):
+        """updates the content of this context."""
+        if contexts is None:
+            contexts = [self]
+        else:
+            contexts.append(self)
+        return self._root.write(value, contexts=contexts)
+
+    def readall(self, contexts=None):
+        if contexts is None:
+            contexts = [self]
+        else:
+            contexts.append(self)
+        return self._root.readall(contexts=contexts)
+
+    def writeall(self, contexts=None):
+        if contexts is None:
+            contexts = [self]
+        else:
+            contexts.append(self)
+        return self._root.writeall(contexts=contexts)
+
+    def subscope(self, key, contexts=None):
+        """retrieves the existing sub-scope structure for the format within this context."""
+        if contexts is None:
+            contexts = [self]
+        else:
+            contexts.append(self)
+        scope = self._root.subscope(key, contexts=contexts)
+        return self.copy(scope=scope)
+
+    def resolve(self, path):
+        context = self
+        keypath = path.split(self._sep)
+        # traverse to the deepest entry
+        for key in keypath:
+            entry = context.subscope(key)
+        return entry
+
+    def lock(self, contexts=None):
+        """should return a Context that is locked."""
+        if contexts is None:
+            contexts = [self]
+        else:
+            contexts.append(self)
+        return self.copy(transaction=self._root.lock(contexts=contexts))
+
+    def unlock(self, transaction=None, contexts=None):
+        """free resources for new transactions."""
+        if contexts is None:
+            contexts = [self]
+            if self._transaction:
+                transaction = self._transaction
+        else:
+            contexts.append(self)
+            if (not transaction) and (self._transaction):
+                transaction = self._transaction
+        self._transaction = self._root.unlock(transaction=transaction, contexts=contexts)
+
 
 class AttributeManager:
     """interface for editing entry attributes."""
