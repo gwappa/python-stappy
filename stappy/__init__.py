@@ -24,7 +24,7 @@ import sys as _sys
 import pathlib as _pathlib
 import json as _json
 import zlib as _zlib
-from collections import OrderedDict as _OrderedDict
+from collections import OrderedDict as _OrderedDict, namedtuple as _namedtuple
 from functools import wraps
 
 import numpy as _np
@@ -71,6 +71,15 @@ VERSION_STR = "0.5"
 DEBUG       = False
 
 SEP         = '/'
+
+# data types
+class DataFormats:
+    Entry   = 'entry'
+    NDArray = 'ndarray'
+    Table   = 'table'
+    Struct  = 'struct'
+    Binary  = 'binary'
+
 INFO_TYPES  = (int, float, str)
 
 def debug(msg):
@@ -128,49 +137,57 @@ class PathFormat:
             return tuple(path[:-1])
 
     @classmethod
-    def concatenate(cls, basepath, additions):
+    def concatenate(cls, basepath, additions, method=None):
         if isinstance(additions, str):
             additions = cls.from_string(additions)
+        if method is None:
+            method    = cls.append
         path = basepath
         for elem in additions:
-            if len(elem) == 0:
-                raise ValueError('cannot concatenate a zero-length path component.')
-            elif elem == cls.parent:
-                path = cls.compute_parent(path)
-            elif elem == cls.current:
-                pass
-            else:
-                path = path + (elem,)
+            path = method(path, elem)
         return path
 
-class Structure:
+    @classmethod
+    def append(cls, path, elem):
+        if len(elem) == 0:
+            raise ValueError('cannot concatenate a zero-length path component.')
+        elif elem == cls.parent:
+            path = cls.compute_parent(path)
+        elif elem == cls.current:
+            pass
+        else:
+            path = path + (elem,)
+        return path
+
+
+class DataEntry:
     """the base interface for structured database access."""
     create_attribute_default = False
 
     def __init__(self, path, context=None):
-        if context is None:
-            raise ValueError("context cannot be None")
-        self._path    = path
-        self._context = context
+        if driver is None:
+            raise ValueError("driver cannot be None")
+        self.path    = path
+        self.context = context
 
     def __repr__(self):
         cls = self.__class__.__name__
-        cxt = self._context.get_repr()
-        pathrepr = PathFormat.to_string(self._path)
+        cxt = self.context.get_repr()
+        pathrepr = PathFormat.to_string(self.path)
         return f"{cls}{cxt}[{repr(pathrepr)}]"
 
     def __getitem__(self, path):
-        return self.__class__(PathFormat.concatenate(self._path, path), self._context)
+        return self.__class__(PathFormat.concatenate(self.path, path), self.context)
 
     def __getattr__(self, name):
         if name == 'parent':
-            return self.__class__(PathFormat.compute_parent(self._path), self._context)
+            return self.__class__(PathFormat.compute_parent(self.path), self.context)
         elif name == 'attr':
-            return self._context.get_attribute_root(self._path, create=create_attribute_default)
+            return self.context.get_attribute_root(self.path, create=create_attribute_default)
         elif name == 'format':
-            return self._context.get_format(self._path)
+            return self.context.get_format(self.path)
         elif name == 'name':
-            return PathFormat.compute_name(self._path)
+            return PathFormat.compute_name(self.path)
         else:
             raise AttributeError(name)
 
@@ -183,34 +200,34 @@ class Structure:
     def exists(self, format=None):
         """returns if any entry exists at this path (with the specified format(s),
         or None without specification)."""
-        return self._context.entry_exists(self._path, format=format)
+        return self.context.entry_exists(self.path, format=format)
 
-    def create(self, parents=True):
+    def create(self, parents=True, ignore_existing=True):
         """create a group that has the corresponding path."""
-        self._context.create_group(self._path, parents=parents)
+        self.context.create_group(self.path, parents=parents, ignore_existing=ignore_existing)
         return self
 
     def load(self, format='infer'):
         """retrieves the content of this entry."""
         if (format is None) or (format == 'infer'):
-            format = self._context.get_format(self._path)
-        return self._context.get_value(self, format=format)
+            format = self.context.get_format(self.path)
+        return self.context.get_value(self, format=format)
 
     def store(self, value, format='infer', parents=True):
         """stores the value as the content of this entry."""
         if (format is None) or (format == 'infer'):
             format = infer_format(value)
-        self._context.set_value(self._path, value, format=format, parents=parents)
+        self.context.set_value(self.path, value, format=format, parents=parents)
 
     def keys(self, format=None):
         """iterates child names (with or without specified format(s))."""
-        return self._context.child_names(self._path, format=format)
+        return self.context.child_names(self.path, format=format)
 
     def values(self, format=None, unwrap=False):
         """returns a generator that iterates child values (with or without specified format(s)).
 
         if `unwrap` is True, `entry.load()` is called for each of children."""
-        for name in self._context.child_names(self._path, format=format):
+        for name in self.context.child_names(self.path, format=format):
             entry = self[name]
             if unwrap == True:
                 entry = entry.load()
@@ -222,34 +239,35 @@ class Structure:
         if `unwrap` is True, `entry.load()` is called for each of children.
         if `as_path` is True, child names are given as the path tuple from the context root.
         """
-        for name in self._context.child_names(self._path, format=format):
+        for name in self.context.child_names(self.path, format=format):
             entry = self[name]
             if as_path == True:
-                path = entry._path
+                path = entry.path
             else:
                 path = name
             if unwrap == True:
                 entry = entry.load()
             yield path, entry
 
-class Context:
-    """the base class defining the structure context.
-    e.g. EntryContext defines the context for 'proper' database context,
-    whereas AttributeContext defines the context for attriubtes of entries."""
+class DataContext:
+    """the base class defining the structure context."""
     name    = None
 
     @abstractmethod
     def get_attribute_root(self, path, create=False):
-        """returns the root attribute context for the entry at the path.
-
-        if `create` is True, it creates the base entry whenever `entry_exists` returns False.
-        for attribute contexts, this method likely raises a RuntimeError."""
+        """returns the root attribute entry for the entry at the path.
+        if `create` is True, it creates the base entry whenever `entry_exists` returns False."""
         pass
 
     @abstractmethod
     def get_repr(self):
         """returns a proper representation of this context that can be used
         for repr(Structure)"""
+        pass
+
+    @abstractmethod
+    def child_names(self, path, format=None):
+        """iterates names of child entries (if any) under this path."""
         pass
 
     @abstractmethod
@@ -263,7 +281,7 @@ class Context:
         pass
 
     @abstractmethod
-    def create_group(self, path, parents=True):
+    def create_group(self, path, parents=True, ignore_existing=True):
         """creates a data group at path. if `parents` is True, calling this also
         creates any missing parent groups."""
         pass
@@ -280,10 +298,235 @@ class Context:
             format = infer_format(value)
         pass
 
-    @abstractmethod
+class FileSystemContext(DataContext):
+    """a database scheme based on the OS file system."""
+    format        = "barez"
+    suffix        = ".barezdb"
+
+    metadata_stem = ".metadata"
+
+    ATTRIBUTE_KEY = ".attribute"
+    ENTRIES_KEY   = ".entries"
+
+    FORMAT_KEY    = '.format'
+    ENTRYTYPE_KEY = 'type'
+    ENTRYFILE_KEY = 'file'
+    DATATYPE_KEY  = 'dtype'
+    DATASHAPE_KEY = 'shape'
+
+    format_dict     = {}
+    metadata_suffix = '.json'
+    ndarray_suffix  = '.zarr'
+    table_suffix    = '.csv'
+    struct_suffix   = '.json'
+
+    NDARRAY_OPTS  = {'compression': 'zlib'}
+    TABLE_OPTS    = {'format': 'csv'}
+    STRUCT_OPTS   = {'format': 'json'}
+
+    attr_object   = _OrderedDict
+
+    rootpath      = None
+
+    @classmethod
+    def append_path(cls, path, elem):
+        return path / elem
+
+    @classmethod
+    def as_filepath(cls, rootpath, path):
+        return PathFormat.concatenate(rootpath, path, method=cls.append_path)
+
+    @classmethod
+    def init_format_dict(cls):
+        """loads cls.format_dict with `suffix -> (DataFormats, options)` dictionary."""
+        cls.format_dict[cls.ndarray_suffix] = (DataFormats.NDArray, cls.NDARRAY_OPTS)
+        cls.format_dict[cls.table_suffix]   = (DataFormats.Table, cls.TABLE_OPTS)
+        cls.format_dict[cls.struct_suffix]  = (DataFormats.Struct, cls.STRUCT_OPTS)
+
+    @classmethod
+    def is_metadata_filename(cls, name):
+        return name in (cls.metadata_stem,)
+
+    @classmethod
+    def load_metadata_file(cls, entry_path):
+        metafile = (entry_path / cls.metadata_stem).with_suffix(cls.metadata_suffix)
+        attrtype = cls.attr_object
+        if metafile.exists():
+            with open(metafile, 'r') as src:
+                metadata = _json.load(src, object_hook=attrtype)
+        else:
+            metadata = attrtype()
+            metadata[cls.ATTRIBUTE_KEY] = attrtype()
+            metadata[cls.ENTRIES_KEY]   = attrtype()
+        return metadata
+
+    @classmethod
+    def store_metadata_file(cls, entry_path, metadata):
+        """overwrites the metadata file under entry"""
+        metafile = (entry_path / cls.metadata_stem).with_suffix(cls.metadata_format)
+        with open(metafile, 'w') as out:
+            _json.dump(metadata, indent=4)
+
+    @classmethod
+    def create_entry_metadata(cls, path, format, dtype=None, shape=None, **kwargs):
+        if isinstance(path, _pathlib.Path):
+            name = path.name
+        elif isinstance(path, (tuple, list)):
+            name = path[-1]
+        else:
+            name = path
+        metadata = cls.attr_object()
+        metadata[cls.FORMAT_KEY] = cls.attr_object()
+        fmt = metadata[cls.FORMAT_KEY]
+        fmt[cls.ENTRYFILE_KEY] = name
+        fmt[cls.ENTRYTYPE_KEY] = format
+        if dtype is not None:
+            fmt[cls.DATATYPE_KEY]  = dtype
+        if shape is not None:
+            fmt[cls.DATASHAPE_KEY] = shape
+        for key, val in kwargs.items():
+            fmt[key] = val
+        return metadata
+
+    @classmethod
+    def infer_metadata(cls, path):
+        """infer data format and other important info about the file at path."""
+        if len(cls.format_dict) == 0:
+            cls.init_format_dict()
+        if path.is_dir():
+            return cls.create_entry_metadata(path, DataFormats.Entry)
+        else:
+            suffix = path.suffix
+            for key, val in cls.format_dict.items():
+                if suffix == key:
+                    fmt, opts = val
+                    if fmt == DataFormats.NDArray:
+                        _warn(f"file at '{path}' misses information about data type and shape. the data may not be read properly.")
+                    return cls.create_entry_metadata(path, val, **opts)
+            # no match
+            return cls.create_entry_metadata(path, val, DataFormats.Binary)
+
+    @classmethod
+    def ensure_metadata(cls, path):
+        """creates/checks/repairs metadata (where necessary).
+        path may not be existent (or not a directory) at the time of calling the method."""
+        if not path.exists():
+            raise FileNotFoundError(path)
+        elif not path.is_dir():
+            raise NotADirectoryError(path)
+        metadata = cls.load_metadata_file(path)
+        entries  = metadata[cls.ENTRIES_KEY]
+
+        # check existence of the corresponding entry for each child files
+        for child_path in path.iterdir():
+            child_name = child_path.stem
+            if cls.is_metadata_filename(child_name):
+                continue
+            if not child_name in entries.keys():
+                entries[child_name] = cls.infer_metadata(child_path)
+        cls.store_metadata_file(path, metadata)
+        return metadata
+
+    @classmethod
+    def find_metadata(cls, rootpath, path):
+        return cls.ensure_metadata(cls.as_filepath(rootpath, path))
+
+    def __init__(self, rootpath):
+        self.rootpath = _pathlib.Path(rootpath)
+
+    def get_repr(self):
+        return f"({repr(str(self.rootpath))}, format={repr(self.format)})"
+
     def child_names(self, path, format=None):
-        """iterates names of child entries (if any) under this path."""
+        metadata = self.__class__.find_metadata(self.rootpath, path)
+        found = []
+        for name, val in metadata[self.__class__.ENTRIES_KEY].items():
+            type = val[self.__class__.FORMAT_KEY][self.__class__.ENTRYTYPE_KEY]
+            if (format is None) or (format == type):
+                found.append(name)
+        return tuple(found)
+
+    def get_format(self, path):
+        """returns the format of the entry at the path"""
+        metadata = self.__class__.find_metadata(self.rootpath, path[:-1])
+        if path[-1] not in metadata[self.__class__.ENTRIES_KEY].keys():
+            raise KeyError(path[-1])
+        else:
+            entry = metadata[self.__class__.ENTRIES_KEY][path[-1]]
+            return entry[self.__class__.FORMAT_KEY][self.__class__.ENTRYTYPE_KEY]
+
+    def entry_exists(self, path, format=None):
+        """returns if an entry exists at path (with or without specified formats)."""
+        try:
+            fmt = self.get_format(path)
+            if format is None:
+                return True
+            elif isinstance(format, str):
+                format = (format,)
+            return fmt in format
+        except FileNotFoundError:
+            return False
+        except NotADirectoryError:
+            return False
+        except KeyError:
+            return False
+
+    def add_entry_metadata(self, parent_entrypath, child_name, format, **kwargs):
+        parent_filepath = self.__class__.as_filepath(self.rootpath, parent_entrypath)
+        parent_meta     = self.__class__.load_metadata_file(parent_filepath)
+        parent_meta[cls.ENTRIES_KEY][child_name] = self.__class__.create_entry_metadata(child_name, format, **kwargs)
+        self.__class__.store_metadata_file(parent_filepath, parent_meta)
+
+    def create_group(self, path, parents=True, ignore_existing=True):
+        """creates a data group at path. if `parents` is True, calling this also
+        creates any missing parent groups."""
+        # handle cases when an entry exists at `path`
+        if self.entry_exists(path):
+            fmt = self.get_format(path)
+            if fmt != DataFormats.Entry:
+                parent = PathFormat.to_string(PathFormat.compute_parent(path))
+                raise FileExistsError(f"a '{fmt}' entry with the same name already exists in '{parent}'")
+            elif ignore_existing != True:
+                raise FileExistsError(f"group '{path[-1]}' already exists.")
+            else:
+                # just returns
+                return
+
+        # otherwise ensure existence of the parent entry
+        parent = path[:-1]
+        if not self.entry_exists(parent):
+            if parents != True:
+                parent = PathFormat.to_string(parent)
+                raise FileNotFoundError(f"parent directory '{}' not found")
+            else:
+                self.create_group(parent, parents=True, ignore_existing=True)
+        else:
+            fmt = self.get_format(parent)
+            if fmt != DataFormats.Entry:
+                gparent = PathFormat.to_string(PathFormat.compute_parent(parent))
+                raise FileExistsError(f"a '{fmt}' entry with the same name already exists in '{gparent}'")
+
+        # create entry group
+        filepath = self.__class__.as_filepath(self.rootpath, path)
+        filepath.mkdir()
+        self.__class__.ensure_metadata(filepath)
+        self.add_entry_metadata(parent, path[-1], DataFormats.Entry)
+
+    @abstractmethod
+    def get_value(self, path, format=None):
+        """load a data at path (with or without specified formats)."""
         pass
+
+    @abstractmethod
+    def set_value(self, path, value, format=None, parents=True):
+        """stores a value at path (with or without specified formats)."""
+        if (format is None) or (format == 'infer'):
+            format = infer_format(value)
+        pass
+
+    @abstractmethod
+    def get_attribute_root(self, path, create=False):
+        raise NotImplementedError("get_attribute_root")
 
 class Transaction:
     """represents the locked state to a context."""
