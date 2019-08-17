@@ -1,6 +1,8 @@
 import setuptools
 from stappy import VERSION_STR
 
+raise RuntimeError("This is in the ALPHA phase; do not install it!")
+
 setuptools.setup(
     name='stappy',
     version=VERSION_STR,
@@ -22,4 +24,3 @@ setuptools.setup(
         # nothing for the time being
     }
 )
-
