@@ -26,7 +26,7 @@
 
 from .utils import assert_type as _assert_type
 
-VALID_TYPES = ('dataset', 'table', 'keyvalue', 'image', 'binary')
+VALID_TYPES = ('group', 'dataset', 'table', 'keyvalue', 'image', 'binary')
 SEP         = '/'
 ATTRSEP     = '/'
 
@@ -38,8 +38,37 @@ def __slot_to_datatype(slot):
 def check_datatype(datatype, value):
     return value
 
+class Paths(object):
+    """path manipulations"""
+    @staticmethod
+    def get_parent(path, attribute=False):
+        """returns the parent path, or None if there is not parent for that path."""
+        try:
+            lastsep = path.rindex(SEP if attribute == False else ATTRSEP)
+            if lastsep == 0:
+                # top level
+                return None
+            else:
+                return path[:lastindex]
+        except ValueError:
+            return None
+
+class EntryNotFoundError(IOError):
+    def __init__(self, msg):
+        IOError.__init__(self, msg)
+
 class Protocol(object):
-    """the base class for the database protocol."""
+    """the base class for the database protocol.
+
+    Notes on the file mode:
+
+    - 'r' : read-only mode.
+    - 'r+': update mode (writable; raises an error when the file does not exist).
+    - 'a' : append mode (read-only for existing entries; can add new entries).
+    - 'x' : exclusive write mode (writable; raises an error when the file already exists).
+    - 'w' : clean write mode (writable; removes any existing files).
+
+    """
     name = "NotSpecified"
 
     @classmethod
@@ -51,10 +80,23 @@ class Protocol(object):
         return cls(uri, mode, **kwargs)
 
     def __init__(self, uri, mode='r', **kwargs):
-        if mode not in ('r', 'w', 'r+'):
+        if mode in ('r', 'r+', 'a'):
+            if not self.__exists_database__(uri, **kwargs):
+                raise FileNotFoundError("cannot open {} using this protocol".format(uri))
+            self._handle = self.__load_database__(uri, **kwargs)
+        elif mode == 'w':
+            if self.__exists_database__(uri, **kwargs):
+                self.__remove_database__(uri, **kwargs)
+            self._handle = self.__create_database__(uri, **kwargs)
+        elif mode == 'x':
+            if self.__exists_database__(uri, **kwargs):
+                raise FileExistsError("cannot create a new database at path: "+uri)
+            self._handle = self.__create_database__(uri, **kwargs)
+        else:
             raise ValueError("unknown mode: "+mode)
-        self._uri  = uri
-        self._mode = mode
+
+        self._uri    = uri
+        self._mode   = mode
 
     def __repr__(self):
         modestr = '<read-only>' if self._mode == 'r' else ''
@@ -62,25 +104,77 @@ class Protocol(object):
                         file=self._uri,
                         info=modestr)
 
-    def __typeof__(self, path):
-        raise NotImplementedError("cannot read data type using this protocol")
+    def __exists_database__(self, uri, **kwargs):
+        """(delegate method) returns True if a database exists at this path/URI."""
+        return False
 
-    def __readdata__(self, path, type, **kwargs):
-        raise NotImplementedError("cannot read data using this protocol")
+    def __exists_entry__(self, path, type=None):
+        """(delegate method) returns True if an entry exists at the specified path."""
+        return False
 
-    def __writedata__(self, path, type, value, **kwargs):
-        raise NotImplementedError("cannot write data using this protocol")
+    def __create_database__(self, uri, **kwargs):
+        """(delegate method) creates a database at the path/URI."""
+        raise NotImplementedError("cannot create a database using this protocol")
 
-    def __removedata__(self, path, **kwargs):
-        raise NotImplementedError("cannot remove data using this protocol")
+    def __load_database__(self, uri, **kwargs):
+        """(delegate method) loads an existing database at the path/URI."""
+        raise NotImplementedError("cannot load a database using this protocol")
 
-    def __readattr__(self, entry, path, type, **kwargs):
+    def __remove_database__(self, uri, **kwargs):
+        """(delegate method) removes a database specified by the path/URI."""
+        raise NotImplementedError("cannot remove a database using this protocol")
+
+    def __read_entry__(self, path, type, **kwargs):
+        """(delegate method) performs a single read operation."""
+        raise NotImplementedError("cannot read entry using this protocol")
+
+    def __write_entry__(self, path, type, value=None, **kwargs):
+        """(delegate method) performs a single write operation."""
+        raise NotImplementedError("cannot write entry using this protocol")
+
+    def __remove_entry__(self, path, **kwargs):
+        """(delegate method) performs a single delete operation."""
+        raise NotImplementedError("cannot remove entry using this protocol")
+
+    def type_of(self, path):
+        raise NotImplementedError("cannot read entry type using this protocol")
+
+    def read_entry(self, path, type, **kwargs):
+        if not self.__exists_entry__(path, type=type):
+            raise EntryNotFoundError("path '{}' does not exist with type '{}'".format(path, type))
+        return self.__read_entry__(path, type, **kwargs)
+
+    def write_entry(self, path, type, value=None, **kwargs):
+        if self._mode == 'r':
+            raise IOError("the protocol is read-only")
+        else:
+            parent = Paths.get_parent(path)
+            if not self.__exists_entry__(parent):
+                self.write_entry(parent, 'entry', **kwargs)
+            elif self.__exists_entry__(path):
+                if self._mode == 'a':
+                    raise IOError("cannot overwrite an entry under the append mode")
+                elif self.type_of(path) != 'entry':
+                    self.remove_entry(path, **kwargs)
+            self.__write_entry__(path, type, value, **kwargs)
+
+    def remove_entry(self, path, **kwargs):
+        if self._mode == 'r':
+            raise IOError("the protocol is read-only")
+        elif self._mode == 'a':
+            raise IOError("cannot remove an entry under the append mode")
+        else:
+            if not self.__exists_entry__(path):
+                raise EntryNotFoundError("path does not exist: "+path)
+            self.__remove_entry__(path, **kwargs)
+
+    def read_attribute(self, entry, path, type, **kwargs):
         raise NotImplementedError("cannot read attributes using this protocol")
 
-    def __writeattr__(self, entry, path, type, value, **kwargs):
+    def write_attribute(self, entry, path, type, value, **kwargs):
         raise NotImplementedError("cannot write attributes using this protocol")
 
-    def __removeattr__(self, entry, path, **kwargs):
+    def remove_attribute(self, entry, path, **kwargs):
         raise NotImplementedError("cannot remove attributes using this protocol")
 
 
@@ -101,10 +195,10 @@ class Entry(object):
         elif name == 'attrs':
             return AttributeEntry(self, '')
         elif name == 'type':
-            return self._root._proto.__typeof__(self._path)
+            return self._root._proto.type_of(self._path)
         elif name in __valid_slots:
             datatype = __slot_to_datatype(name)
-            return self._root._proto.__readdata__(self._path, datatype)
+            return self._root._proto.read_entry(self._path, datatype)
         else:
             raise AttributeError(name)
 
@@ -114,7 +208,7 @@ class Entry(object):
             super(Entry, self).__setattr__(name, value)
         elif name in __valid_slots:
             datatype = __slot_to_datatype(name)
-            self._root._proto.__writedata__(self._path, datatype,
+            self._root._proto.write_entry(self._path, datatype,
                                     check_datatype(datatype, value))
         else:
             raise AttributeError("cannot set attribute '{name}'".format(name=name))
@@ -182,7 +276,7 @@ class AttributeEntry(object):
         if name.startswith('_'):
             super(AttributeEntry, self).__setattr__(name, value)
         elif name == 'value':
-            raise NotImplementedError("setting value to an attribute")
+            raise NotImplementedError("cannot set value to an attribute by using this protocol")
         else:
             raise AttributeError("cannot set attribute '{name}'".format(name=name))
 
